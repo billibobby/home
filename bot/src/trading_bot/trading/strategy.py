@@ -20,7 +20,7 @@ class XGBoostStrategy:
     """
     
     def __init__(self, config, logger, predictor: XGBoostPredictor, 
-                 signal_generator: SignalGenerator):
+                 signal_generator: SignalGenerator, paper_trading_engine=None):
         """
         Initialize the XGBoost trading strategy.
         
@@ -29,11 +29,13 @@ class XGBoostStrategy:
             logger: Logger instance
             predictor: XGBoost predictor instance
             signal_generator: Signal generator instance
+            paper_trading_engine: Optional PaperTradingEngine instance for paper trading
         """
         self.config = config
         self.logger = logger
         self.predictor = predictor
         self.signal_generator = signal_generator
+        self.paper_trading_engine = paper_trading_engine
         
         # Initialize dependencies
         self.data_fetcher = StockDataFetcher(config, logger)
@@ -50,7 +52,11 @@ class XGBoostStrategy:
         self.active_positions = {}
         self.signal_history = []
         
-        self.logger.info("XGBoost strategy initialized")
+        # Log paper trading status
+        if paper_trading_engine and config.get('paper_trading.enabled', False):
+            self.logger.info("XGBoost strategy initialized with paper trading enabled")
+        else:
+            self.logger.info("XGBoost strategy initialized")
     
     def analyze(self, symbol: str, account_balance: float = None) -> Optional[Dict]:
         """
@@ -344,16 +350,30 @@ class XGBoostStrategy:
             'take_profit': entry_price * (1 + self.take_profit_pct / 100)
         }
         
+        # Sync with paper trading engine if available
+        if self.paper_trading_engine:
+            # Position is already tracked in paper trading engine after execution
+            # This is just for consistency
+            pass
+        
         self.logger.info(f"Position updated: {symbol} at ${entry_price:.2f}")
     
-    def close_position(self, symbol: str) -> None:
+    def close_position(self, symbol: str, current_price: float = None) -> None:
         """
         Remove position from tracking.
         
         Args:
             symbol: Stock symbol
+            current_price: Current market price (required for paper trading)
         """
         if symbol in self.active_positions:
+            # If paper trading engine exists, close position there first
+            if self.paper_trading_engine:
+                if current_price is None:
+                    self.logger.warning(f"Current price required to close position in paper trading, but not provided for {symbol}")
+                else:
+                    self.paper_trading_engine.close_position(symbol, current_price, reason='manual')
+            
             del self.active_positions[symbol]
             self.logger.info(f"Position closed: {symbol}")
     
@@ -379,4 +399,122 @@ class XGBoostStrategy:
         if limit:
             return self.signal_history[-limit:]
         return self.signal_history.copy()
+    
+    def execute_decision(self, decision: Dict) -> Dict:
+        """
+        Execute a trading decision using paper trading engine.
+        
+        Args:
+            decision: Trading decision dictionary from analyze() method
+            
+        Returns:
+            Execution result dictionary
+        """
+        if self.paper_trading_engine is None:
+            self.logger.warning("Paper trading engine not available - cannot execute decision")
+            return {
+                'success': False,
+                'error': 'Paper trading engine not available'
+            }
+        
+        try:
+            signal = decision.get('signal')
+            symbol = decision.get('symbol')
+            current_price = decision.get('current_price')
+            
+            if not signal or not symbol or current_price is None:
+                return {
+                    'success': False,
+                    'error': 'Invalid decision: missing required fields'
+                }
+            
+            # Determine order side
+            signal_type = signal.get('type')
+            if signal_type in ['BUY', 'STRONG_BUY']:
+                side = 'buy'
+            elif signal_type in ['SELL', 'STRONG_SELL']:
+                side = 'sell'
+            else:
+                return {
+                    'success': False,
+                    'error': f'Cannot execute HOLD signal'
+                }
+            
+            # Calculate quantity based on order side
+            if side == 'buy':
+                # For BUY, calculate quantity from position_size
+                position_size = decision.get('position_size')
+                if position_size is None:
+                    # Use current balance if available
+                    account_summary = self.paper_trading_engine.get_account_summary()
+                    account_balance = account_summary.get('cash_balance', 0)
+                    position_size = account_balance * (self.position_size_pct / 100)
+                
+                quantity = position_size / current_price if current_price > 0 else 0
+                
+                result = self.paper_trading_engine.execute_buy_order(
+                    symbol, quantity, current_price, order_type='market', signal=signal
+                )
+            else:  # sell
+                # For SELL, look up actual holdings
+                position = self.paper_trading_engine.get_position(symbol)
+                if position is None:
+                    return {
+                        'success': False,
+                        'error': f'No position found for {symbol} to sell'
+                    }
+                
+                quantity = position['quantity']
+                
+                result = self.paper_trading_engine.execute_sell_order(
+                    symbol, quantity, current_price, order_type='market', signal=signal
+                )
+            
+            # Update in-memory position tracking if successful
+            if result.get('success'):
+                if side == 'buy':
+                    self.update_position(
+                        symbol,
+                        result['execution_price'],
+                        position_size
+                    )
+                else:  # sell
+                    if result.get('position_closed', False):
+                        self.close_position(symbol, current_price)
+            
+            return result
+        
+        except Exception as e:
+            self.logger.error(f"Failed to execute decision: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def sync_positions_with_engine(self):
+        """
+        Synchronize in-memory positions with paper trading engine state.
+        
+        Useful for initialization and recovery scenarios.
+        """
+        if self.paper_trading_engine is None:
+            return
+        
+        try:
+            engine_positions = self.paper_trading_engine.get_all_positions()
+            
+            # Update active_positions to match engine
+            self.active_positions = {}
+            for symbol, pos in engine_positions.items():
+                self.active_positions[symbol] = {
+                    'entry_price': pos['entry_price'],
+                    'size': pos['quantity'] * pos.get('current_price', pos['entry_price']),
+                    'stop_loss': pos.get('stop_loss'),
+                    'take_profit': pos.get('take_profit')
+                }
+            
+            self.logger.info(f"Synced {len(self.active_positions)} positions with paper trading engine")
+        
+        except Exception as e:
+            self.logger.error(f"Failed to sync positions: {str(e)}")
 
