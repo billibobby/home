@@ -1,0 +1,161 @@
+# Main Configuration File for AI Trading Bot
+
+# Logging Configuration
+logging:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  file_rotation:
+    max_bytes: 10485760  # 10 MB
+    backup_count: 5
+  console_colors: true
+
+# Trading Parameters
+trading:
+  # Position sizing
+  default_position_size: 100  # USD
+  position_size_percentage: 10  # Percentage of portfolio per trade
+  
+  # Risk management
+  risk_percentage: 2  # Maximum risk per trade as percentage of capital
+  max_positions: 5  # Maximum concurrent positions
+  stop_loss_percentage: 2  # Default stop loss percentage
+  take_profit_percentage: 5  # Default take profit percentage
+  
+  # Trading hours (UTC)
+  trading_hours:
+    enabled: false  # Set to true to restrict trading hours
+    start: "09:30"
+    end: "16:00"
+  
+  # Order types
+  default_order_type: "limit"  # market, limit, stop_loss, stop_limit
+  slippage_tolerance: 0.1  # Percentage
+
+# Model Settings
+models:
+  default_model: "random_forest"  # Model type to use
+  model_version: "v1.0"
+  
+  # Training parameters
+  training:
+    test_size: 0.2
+    validation_size: 0.1
+    random_state: 42
+    cross_validation_folds: 5
+  
+  # Prediction thresholds
+  prediction:
+    buy_threshold: 0.6  # Confidence threshold for buy signals
+    sell_threshold: 0.6  # Confidence threshold for sell signals
+    min_confidence: 0.5  # Minimum confidence to act on signal
+  
+  # Feature engineering
+  features:
+    technical_indicators: true
+    sentiment_analysis: false  # Future feature
+    fundamental_data: false  # Future feature
+    lagged_prices: [1, 5, 10, 20]  # Lag periods for price features
+    technical_indicators_list:  # List of indicators to compute
+      - 'SMA_20'
+      - 'SMA_50'
+      - 'RSI_14'
+      - 'MACD'
+      - 'BB_upper'
+      - 'BB_lower'
+    volatility_window: 20  # Rolling window for volatility calculation
+    scaling_method: 'standard'  # Feature scaling method (standard, minmax, robust)
+  
+  # XGBoost Model Configuration
+  xgboost:
+    enabled: true  # Toggle XGBoost model
+    model_file: 'xgboost_stock_v1.json'  # Model filename in models/ directory
+    device: 'cpu'  # Inference device (cpu for deployment, gpu_hist for training)
+    lookback_days: 60  # Historical data window for features
+    target_type: 'regression'  # Or 'classification' for up/down prediction
+    retrain_interval_days: 7  # How often to retrain
+    
+    # Hyperparameters
+    max_depth: 6
+    learning_rate: 0.1
+    n_estimators: 100
+    subsample: 0.8
+    colsample_bytree: 0.8
+
+# Data Settings
+data:
+  # Default timeframes for data collection
+  timeframes:
+    - "1m"
+    - "5m"
+    - "15m"
+    - "1h"
+    - "4h"
+    - "1d"
+  
+  # Default symbols to track
+  symbols:
+    crypto:
+      - "BTC/USDT"
+      - "ETH/USDT"
+      - "BNB/USDT"
+    stocks:
+      - "AAPL"
+      - "GOOGL"
+      - "MSFT"
+      - "TSLA"
+  
+  # Data retention
+  retention_days: 365  # Days to keep historical data
+  cache_enabled: true
+  cache_expiry_minutes: 60
+  
+  # Stock data configuration
+  stock_data_source: 'yfinance'  # Data source for stocks
+  cache_historical_data: true  # Cache downloaded data
+  historical_data_path: 'data/historical/'  # Path for cached data
+
+# API Settings
+api:
+  # Rate limiting
+  rate_limits:
+    requests_per_minute: 60
+    requests_per_second: 2
+  
+  # Timeout and retry
+  timeout_seconds: 30
+  retry_attempts: 3
+  retry_delay_seconds: 5
+  exponential_backoff: true
+  
+  # Exchanges
+  exchanges:
+    binance:
+      enabled: true
+      testnet: true  # Use testnet for development
+    coinbase:
+      enabled: false
+      testnet: true
+    alpaca:
+      enabled: false
+      paper_trading: true  # Use paper trading for stocks
+
+# Database Settings
+database:
+  type: "sqlite"  # sqlite, postgresql, mysql
+  backup_enabled: true
+  backup_interval_hours: 24
+
+# Notification Settings (Future feature)
+notifications:
+  enabled: false
+  channels:
+    email: false
+    telegram: false
+    discord: false
+
+# Performance Monitoring
+monitoring:
+  enabled: true
+  metrics_interval_seconds: 60
+  save_metrics: true
+

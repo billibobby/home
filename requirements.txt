@@ -1,0 +1,16 @@
+# Home Launcher - Requirements
+#
+# This requirements file is for the Home Launcher application only.
+# Individual applications (bot/ and pc/) have their own requirements.txt files.
+# Users should install sub-application dependencies separately if running in development mode.
+#
+# Installation:
+#   pip install -r requirements.txt
+#
+# This only installs launcher dependencies. For full application dependencies, see:
+#   - bot/requirements.txt
+#   - pc/requirements.txt
+
+# GUI framework (same version requirement as both sub-applications for consistency)
+PySide6>=6.4.0
+

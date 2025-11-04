@@ -1,0 +1,45 @@
+# Core Runtime Requirements
+python-dotenv==1.0.0
+PyYAML==6.0.1
+colorlog==6.8.0
+pandas>=2.2.0
+numpy>=1.26.0
+requests==2.31.0
+python-dateutil==2.8.2
+keyring>=24.0.0
+
+# Install with extras for additional features:
+# pip install -e .[gui]   # For GUI support
+# pip install -e .[dev]   # For development tools
+# pip install -e .[build] # For PyInstaller packaging
+# pip install -e .[all]   # Install everything
+
+# GUI extras (install with: pip install -e .[gui])
+# PySide6>=6.5.0
+# pyqtgraph>=0.13.0
+
+# Development extras (install with: pip install -e .[dev])
+# pytest==7.4.3
+# pytest-mock==3.12.0
+# pytest-cov>=4.1.0
+# black>=23.0.0
+# flake8>=6.0.0
+# mypy>=1.5.0
+
+# Build extras (install with: pip install -e .[build])
+# pyinstaller>=6.0.0
+
+# Future dependencies (commented out for now, will be needed in later phases)
+# ccxt==4.1.0  # Cryptocurrency exchange integration
+# ta==0.11.0  # Technical analysis library
+# scikit-learn==1.3.2  # Machine learning
+# tensorflow==2.15.0  # Deep learning (if needed)
+# alpaca-trade-api==3.0.2  # Alpaca trading
+
+# XGBoost and Stock Prediction Dependencies (Phase 2/3)
+xgboost>=2.0.0  # XGBoost library with GPU support (requires CUDA toolkit for GPU training)
+yfinance>=0.2.0  # Yahoo Finance API for stock data fetching
+ta>=0.11.0  # Technical analysis library for indicators (MA, RSI, MACD, etc.)
+scikit-learn>=1.3.0  # For preprocessing, scaling, and evaluation metrics
+# Note: GPU training is done in Google Colab; local deployment only needs CPU support
+
