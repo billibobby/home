@@ -126,12 +126,12 @@ class SettingsDialog(QDialog):
         
         # Docker Image URL
         self.docker_image_input = QLineEdit()
-        self.docker_image_input.setPlaceholderText("Docker image URL for ComfyUI")
+        self.docker_image_input.setPlaceholderText("Docker image URL (e.g., nvidia/cuda, pytorch/pytorch)")
         docker_layout.addRow("Docker Image URL:", self.docker_image_input)
         
         # Help label
         docker_help_label = QLabel(
-            "<small>Default ComfyUI image with CUDA support.<br>"
+            "<small>Default Docker image for GPU instances.<br>"
             "Can be changed per-instance during creation.</small>"
         )
         docker_help_label.setStyleSheet("color: gray;")
@@ -169,7 +169,7 @@ class SettingsDialog(QDialog):
         self.api_key_input.setText(api_key)
         
         # Load Docker image URL
-        docker_image = config.get("docker_image_url", "ghcr.io/ai-dock/comfyui:latest-cuda")
+        docker_image = config.get("docker_image_url", "nvidia/cuda:12.2.0-runtime-ubuntu22.04")
         self.docker_image_input.setText(docker_image)
         
         # Load GPU preferences (will be restored after API data loads)
@@ -344,7 +344,7 @@ class SettingsDialog(QDialog):
     
     def _on_gpu_products_error(self, error_info):
         """Handle GPU products loading error."""
-        exc_type, exc_value, tb_str = error_info
+        _, exc_value, tb_str = error_info
         self.gpu_product_combo.clear()
         self.gpu_product_combo.addItem("Failed to load GPU products")
         self.gpu_product_combo.setEnabled(True)
@@ -389,7 +389,7 @@ class SettingsDialog(QDialog):
     
     def _on_clusters_error(self, error_info):
         """Handle clusters loading error."""
-        exc_type, exc_value, tb_str = error_info
+        _, exc_value, tb_str = error_info
         # Keep optional item, add error message
         while self.cluster_combo.count() > 1:
             self.cluster_combo.removeItem(1)

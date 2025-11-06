@@ -81,7 +81,7 @@ class CreateInstanceDialog(QDialog):
         
         # Docker Image URL field
         self.image_input = QLineEdit()
-        default_image = self.config_manager.get('docker_image_url', 'ghcr.io/ai-dock/comfyui:latest-cuda')
+        default_image = self.config_manager.get('docker_image_url', 'nvidia/cuda:12.2.0-runtime-ubuntu22.04')
         self.image_input.setText(default_image)
         details_layout.addRow("Docker Image URL:", self.image_input)
         
@@ -216,7 +216,7 @@ class CreateInstanceDialog(QDialog):
     
     def _on_gpu_products_error(self, error_info):
         """Handle GPU products loading error."""
-        exc_type, exc_value, tb_str = error_info
+        _, exc_value, tb_str = error_info
         self.gpu_product_combo.clear()
         self.gpu_product_combo.addItem("Failed to load GPU products")
         self.gpu_product_combo.setEnabled(False)
@@ -264,7 +264,7 @@ class CreateInstanceDialog(QDialog):
     
     def _on_clusters_error(self, error_info):
         """Handle clusters loading error."""
-        exc_type, exc_value, tb_str = error_info
+        _, exc_value, tb_str = error_info
         # Keep auto-select option, add error message
         while self.cluster_combo.count() > 1:
             self.cluster_combo.removeItem(1)
@@ -482,7 +482,7 @@ class CreateInstanceDialog(QDialog):
         QApplication.restoreOverrideCursor()
         self.button_box.setEnabled(True)
         
-        exc_type, exc_value, tb_str = error_info
+        _, exc_value, tb_str = error_info
         
         self.logger.error(f"Failed to create instance: {exc_value}")
         
