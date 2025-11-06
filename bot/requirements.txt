@@ -4,6 +4,7 @@ PyYAML==6.0.1
 colorlog==6.8.0
 pandas>=2.2.0
 numpy>=1.26.0
+sqlalchemy>=2.0.0
 requests==2.31.0
 python-dateutil==2.8.2
 keyring>=24.0.0
@@ -31,10 +32,15 @@ keyring>=24.0.0
 
 # Future dependencies (commented out for now, will be needed in later phases)
 # ccxt==4.1.0  # Cryptocurrency exchange integration
-# ta==0.11.0  # Technical analysis library
 # scikit-learn==1.3.2  # Machine learning
 # tensorflow==2.15.0  # Deep learning (if needed)
-# alpaca-trade-api==3.0.2  # Alpaca trading
+# Note: The project uses alpaca-py (not alpaca-trade-api) for Alpaca integration
+# The legacy alpaca-trade-api package is not used and should not be installed
+
+# Multi-Asset Data Fetcher Dependencies (for QQQ trading bot)
+# Alpaca Trading API (Modern SDK)
+alpaca-py>=0.20.0  # REST API and WebSocket streaming for stock trading
+pandas-ta>=0.3.14b  # Technical analysis library for indicators
 
 # XGBoost and Stock Prediction Dependencies (Phase 2/3)
 xgboost>=2.0.0  # XGBoost library with GPU support (requires CUDA toolkit for GPU training)
@@ -42,4 +48,20 @@ yfinance>=0.2.0  # Yahoo Finance API for stock data fetching
 ta>=0.11.0  # Technical analysis library for indicators (MA, RSI, MACD, etc.)
 scikit-learn>=1.3.0  # For preprocessing, scaling, and evaluation metrics
 # Note: GPU training is done in Google Colab; local deployment only needs CPU support
+
+# Hyperparameter Optimization Dependencies (Segment 5)
+optuna>=3.0.0  # Bayesian optimization framework
+plotly>=5.0.0  # Interactive visualization for optimization plots
+scipy>=1.10.0  # For ensemble weight optimization
+
+# Visualization Dependencies (for feature importance plots)
+matplotlib>=3.5.0  # Used by xgboost_trainer.py for plotting feature importance charts
+
+# Sentiment Analysis Dependencies (Phase 1)
+finnhub-python>=2.4.0  # Finnhub API client for news sentiment
+# Note: Alpha Vantage uses requests library (already included)
+
+# Optional: Advanced sentiment analysis (for custom scoring)
+# transformers>=4.30.0  # For FinBERT sentiment model
+# torch>=2.0.0  # Required by transformers
 

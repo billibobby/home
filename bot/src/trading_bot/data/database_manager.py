@@ -13,6 +13,9 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple, Any
 from contextlib import contextmanager
 
+from sqlalchemy import create_engine, event, exc as sqlalchemy_exc, text
+from sqlalchemy.pool import QueuePool
+
 from trading_bot.utils.helpers import retry_on_failure, ensure_dir
 from trading_bot.utils.exceptions import DatabaseError
 from trading_bot.utils.paths import get_writable_app_dir
@@ -23,14 +26,13 @@ class DatabaseManager:
     Database manager for persistent storage of trading data.
     
     Handles trades, positions, portfolio snapshots, and performance metrics
-    with thread-safe operations.
+    with thread-safe operations and connection pooling.
     
     Note: Connection Management
-    This implementation uses thread-local connections, not a traditional connection pool.
-    Each thread gets its own SQLite connection that persists for the thread's lifetime.
-    The `connection_pool_size` configuration parameter is currently unused but reserved
-    for future implementation. The `close()` method only closes the current thread's
-    connection; other threads' connections remain open until their threads terminate.
+    This implementation uses SQLAlchemy's QueuePool for proper connection pooling.
+    Connections are pooled and reused across threads, providing better resource
+    management than thread-local connections. Transaction-scoped connections are
+    maintained in thread-local storage to ensure atomicity.
     """
     
     def __init__(self, config, logger):
@@ -61,18 +63,46 @@ class DatabaseManager:
         ensure_dir(os.path.dirname(self.db_path))
         
         # Connection pool settings
-        # Note: pool_size is currently unused - this implementation uses thread-local connections
-        # Each thread gets its own connection that persists for the thread's lifetime
-        self.pool_size = config.get('database.connection_pool_size', 5)
+        pool_size = config.get('database.pool_size', config.get('database.connection_pool_size', 10))
+        pool_max_overflow = config.get('database.pool_max_overflow', 20)
+        pool_timeout = config.get('database.pool_timeout', 30)
+        pool_recycle = config.get('database.pool_recycle', 3600)
         self.timeout = config.get('database.timeout_seconds', 30)
         self.enable_wal = config.get('database.enable_wal_mode', True)
+        
+        # Normalize Windows path to POSIX format for SQLite URL
+        posix_path = Path(self.db_path).as_posix()
+        
+        # Construct SQLAlchemy database URL
+        database_url = f"sqlite:///{posix_path}"
+        
+        # Create SQLAlchemy engine with QueuePool
+        self.engine = create_engine(
+            database_url,
+            poolclass=QueuePool,
+            pool_size=pool_size,
+            max_overflow=pool_max_overflow,
+            pool_timeout=pool_timeout,
+            pool_recycle=pool_recycle,
+            pool_pre_ping=True,
+            echo=False,
+            connect_args={'check_same_thread': False, 'timeout': self.timeout}
+        )
+        
+        # Register connect event to apply PRAGMAs on every new connection
+        @event.listens_for(self.engine, 'connect')
+        def on_connect(dbapi_conn, conn_record):
+            """Apply connection-level PRAGMAs on every new DB-API connection."""
+            # Set busy_timeout for this connection (in milliseconds)
+            dbapi_conn.execute(f"PRAGMA busy_timeout={self.timeout * 1000}")
+            # WAL mode is database-level, so it's set once in _initialize_database()
         
         # Threading lock for transactions
         self._lock = threading.Lock()
         
-        # Thread-local connection storage (not a traditional pool)
-        # Each thread maintains its own connection, which is reused across operations
-        self._local = threading.local()
+        # Thread-local storage for transaction-scoped connections
+        # Used to ensure the same connection is used throughout a transaction
+        self._transaction_local = threading.local()
         
         # Initialize database
         self._initialize_database()
@@ -83,13 +113,13 @@ class DatabaseManager:
         """Create database file and schema if it doesn't exist."""
         try:
             with self.get_connection() as conn:
-                # Enable WAL mode for better concurrency
+                # Enable WAL mode for better concurrency (database-level, set once)
                 if self.enable_wal:
-                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute(text("PRAGMA journal_mode=WAL"))
+                    conn.commit()
                     self.logger.debug("WAL mode enabled")
                 
-                # Set timeout
-                conn.execute(f"PRAGMA busy_timeout={self.timeout * 1000}")
+                # busy_timeout is now set via connect event for all connections
                 
                 # Create schema
                 self._create_schema(conn)
@@ -104,39 +134,53 @@ class DatabaseManager:
     @contextmanager
     def get_connection(self):
         """
-        Get a database connection (thread-local, not pooled).
+        Get a database connection from the pool.
         
-        This method returns a thread-local connection that is reused across
-        calls within the same thread. Each thread maintains its own connection.
-        This is not a traditional connection pool implementation.
+        If we're in a transaction context, returns the transaction-scoped connection.
+        Otherwise, gets a connection from the pool and returns it after use.
         
         Yields:
-            sqlite3.Connection object
+            SQLAlchemy Connection object (which provides SQLite-like API)
         """
-        # Use thread-local connection (one per thread, not a pool)
-        if not hasattr(self._local, 'connection') or self._local.connection is None:
-            self._local.connection = sqlite3.connect(
-                self.db_path,
-                check_same_thread=False,
-                timeout=self.timeout
-            )
-            self._local.connection.row_factory = sqlite3.Row  # Return dict-like rows
+        # Check if we're in a transaction context
+        if hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None:
+            yield self._transaction_local.connection
+            return
         
-        conn = self._local.connection
+        # Not in transaction - get connection from pool
         try:
-            yield conn
+            with self.engine.connect() as conn:
+                # Set row factory for dict-like results
+                # SQLAlchemy connections use text() for raw SQL, but we need to maintain compatibility
+                # Wrap the connection to provide SQLite-like API
+                yield conn
+        except sqlalchemy_exc.TimeoutError as e:
+            pool_timeout = self.config.get('database.pool_timeout', 30)
+            raise DatabaseError(
+                f"Connection pool exhausted (timeout after {pool_timeout}s). Consider increasing pool_size or max_overflow.",
+                details={'error': str(e), 'pool_timeout': pool_timeout}
+            )
+        except sqlalchemy_exc.DBAPIError as e:
+            if hasattr(e, 'connection_invalidated') and e.connection_invalidated:
+                raise DatabaseError(
+                    "Database connection lost. Reconnecting...",
+                    details={'error': str(e)}
+                )
+            raise DatabaseError(
+                f"Database operation failed: {str(e)}",
+                details={'error': str(e)}
+            )
         except Exception as e:
-            conn.rollback()
             raise DatabaseError(
                 f"Database operation failed: {str(e)}",
                 details={'error': str(e)}
             )
     
-    def _create_schema(self, conn: sqlite3.Connection):
+    def _create_schema(self, conn):
         """Create all database tables and indexes."""
         try:
             # Trades table
-            conn.execute("""
+            conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -154,20 +198,20 @@ class DatabaseManager:
                     signal_confidence REAL,
                     notes TEXT
                 )
-            """)
+            """))
             
             # Indexes for trades
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_timeframe ON trades(timeframe)")
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trades_timeframe ON trades(timeframe)"))
             # Composite index for symbol and exit_time ordering/filtering
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol_exit_time ON trades(symbol, exit_time)")
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trades_symbol_exit_time ON trades(symbol, exit_time)"))
             
             # Positions table
             # Note: For existing databases, the UNIQUE constraint on symbol may need to be removed manually
             # by recreating the table or using migration. For new databases, this schema uses composite uniqueness.
-            conn.execute("""
+            conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS positions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -184,14 +228,14 @@ class DatabaseManager:
                     strategy TEXT,
                     UNIQUE(symbol, timeframe, strategy)
                 )
-            """)
+            """))
             
             # Indexes for positions
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_entry_time ON positions(entry_time)")
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_positions_entry_time ON positions(entry_time)"))
             
             # Portfolio snapshots table
-            conn.execute("""
+            conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS portfolio_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT NOT NULL,
@@ -203,13 +247,13 @@ class DatabaseManager:
                     total_pnl REAL,
                     notes TEXT
                 )
-            """)
+            """))
             
             # Index for snapshots
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON portfolio_snapshots(timestamp)")
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON portfolio_snapshots(timestamp)"))
             
             # Performance metrics table
-            conn.execute("""
+            conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS performance_metrics (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT NOT NULL,
@@ -226,11 +270,32 @@ class DatabaseManager:
                     avg_loss REAL,
                     total_return REAL
                 )
-            """)
+            """))
             
             # Indexes for metrics
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON performance_metrics(timestamp)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_period ON performance_metrics(period)")
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON performance_metrics(timestamp)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_metrics_period ON performance_metrics(period)"))
+            
+            # Feature importance table
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS feature_importance (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    feature_name TEXT NOT NULL,
+                    importance_score REAL NOT NULL,
+                    model_id TEXT,
+                    symbol TEXT,
+                    model_version TEXT,
+                    training_date TEXT,
+                    metadata TEXT
+                )
+            """))
+            
+            # Indexes for feature_importance
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_feature_importance_timestamp ON feature_importance(timestamp)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_feature_importance_feature_name ON feature_importance(feature_name)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_feature_importance_symbol ON feature_importance(symbol)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_feature_importance_model_id ON feature_importance(model_id)"))
             
             conn.commit()
             self.logger.debug("Database schema created successfully")
@@ -243,7 +308,7 @@ class DatabaseManager:
                 details={'error': str(e)}
             )
     
-    @retry_on_failure(max_attempts=3, delay=1.0, backoff=2.0)
+    @retry_on_failure(max_attempts=3, delay=1.0, backoff=2.0, exceptions=(DatabaseError, sqlalchemy_exc.DBAPIError, sqlalchemy_exc.TimeoutError))
     def _execute_query(self, query: str, params: tuple = None, fetch: bool = False, commit: bool = True):
         """
         Execute a database query with retry logic.
@@ -260,21 +325,47 @@ class DatabaseManager:
         """
         try:
             with self.get_connection() as conn:
-                cursor = conn.cursor()
+                # Use exec_driver_sql for parameterized queries to properly handle ? placeholders
                 if params:
-                    cursor.execute(query, params)
+                    result = conn.exec_driver_sql(query, params)
                 else:
-                    cursor.execute(query)
+                    result = conn.exec_driver_sql(query)
                 
                 if fetch:
-                    return cursor.fetchall()
+                    # Convert SQLAlchemy Row objects to dict-like objects
+                    # SQLAlchemy 2.0 returns Row objects that are dict-like
+                    rows = result.fetchall()
+                    # Convert to list of dicts for backward compatibility
+                    return [dict(row._mapping) for row in rows]
                 else:
                     # Only commit if explicitly requested and not in a transaction
-                    if commit and not conn.in_transaction:
+                    # Check if we're in a transaction context (stored in thread-local)
+                    in_transaction = hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None
+                    if commit and not in_transaction:
                         conn.commit()
-                    return cursor.lastrowid if cursor.lastrowid else None
+                    # Get lastrowid from result
+                    return result.lastrowid if hasattr(result, 'lastrowid') and result.lastrowid else None
                     
-        except sqlite3.Error as e:
+        except sqlalchemy_exc.TimeoutError as e:
+            pool_timeout = self.config.get('database.pool_timeout', 30)
+            self.logger.error(f"Query execution failed: Pool exhausted (timeout after {pool_timeout}s)")
+            raise DatabaseError(
+                f"Connection pool exhausted (timeout after {pool_timeout}s). Consider increasing pool_size or max_overflow.",
+                details={'query': query[:100], 'error': str(e), 'pool_timeout': pool_timeout}
+            )
+        except sqlalchemy_exc.DBAPIError as e:
+            if hasattr(e, 'connection_invalidated') and e.connection_invalidated:
+                self.logger.error(f"Query execution failed: Connection invalidated")
+                raise DatabaseError(
+                    "Database connection lost. Reconnecting...",
+                    details={'query': query[:100], 'error': str(e)}
+                )
+            self.logger.error(f"Query execution failed: {str(e)}, Query: {query[:100]}")
+            raise DatabaseError(
+                f"Query execution failed: {str(e)}",
+                details={'query': query[:100], 'error': str(e)}
+            )
+        except Exception as e:
             self.logger.error(f"Query execution failed: {str(e)}, Query: {query[:100]}")
             raise DatabaseError(
                 f"Query execution failed: {str(e)}",
@@ -285,18 +376,40 @@ class DatabaseManager:
     
     def begin_transaction(self):
         """Begin a database transaction."""
-        with self.get_connection() as conn:
-            conn.execute("BEGIN TRANSACTION")
+        # Acquire a connection from the pool
+        conn = self.engine.connect()
+        # Store it in thread-local for transaction scope
+        self._transaction_local.connection = conn
+        # Begin transaction
+        conn.begin()
     
     def commit_transaction(self):
         """Commit the current transaction."""
-        with self.get_connection() as conn:
+        # Get connection from thread-local
+        conn = self._transaction_local.connection
+        if conn is None:
+            raise DatabaseError("No active transaction to commit")
+        try:
             conn.commit()
+        finally:
+            # Close connection (returns to pool)
+            conn.close()
+            # Clear thread-local
+            self._transaction_local.connection = None
     
     def rollback_transaction(self):
         """Rollback the current transaction."""
-        with self.get_connection() as conn:
+        # Get connection from thread-local
+        conn = self._transaction_local.connection
+        if conn is None:
+            raise DatabaseError("No active transaction to rollback")
+        try:
             conn.rollback()
+        finally:
+            # Close connection (returns to pool)
+            conn.close()
+            # Clear thread-local
+            self._transaction_local.connection = None
     
     @contextmanager
     def transaction(self):
@@ -465,10 +578,10 @@ class DatabaseManager:
         """Delete a trade record."""
         query = "DELETE FROM trades WHERE id = ?"
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, (trade_id,))
-            deleted_count = cursor.rowcount
-            if not conn.in_transaction:
+            result = conn.exec_driver_sql(query, (trade_id,))
+            deleted_count = result.rowcount
+            in_transaction = hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None
+            if not in_transaction:
                 conn.commit()
         self.logger.info(f"Trade {trade_id} deleted")
         return deleted_count
@@ -477,10 +590,10 @@ class DatabaseManager:
         """Bulk delete old trades."""
         query = "DELETE FROM trades WHERE exit_time < ?"
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, (date,))
-            deleted_count = cursor.rowcount
-            if not conn.in_transaction:
+            result = conn.exec_driver_sql(query, (date,))
+            deleted_count = result.rowcount
+            in_transaction = hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None
+            if not in_transaction:
                 conn.commit()
         return deleted_count
     
@@ -809,10 +922,10 @@ class DatabaseManager:
         """Force delete position without creating trade record."""
         query = "DELETE FROM positions WHERE symbol = ?"
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, (symbol,))
-            deleted_count = cursor.rowcount
-            if commit and not conn.in_transaction:
+            result = conn.exec_driver_sql(query, (symbol,))
+            deleted_count = result.rowcount
+            in_transaction = hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None
+            if commit and not in_transaction:
                 conn.commit()
         self.logger.info(f"Position deleted: {symbol}")
         return deleted_count
@@ -935,10 +1048,10 @@ class DatabaseManager:
         """Delete old snapshots."""
         query = "DELETE FROM portfolio_snapshots WHERE timestamp < ?"
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, (date,))
-            deleted_count = cursor.rowcount
-            if not conn.in_transaction:
+            result = conn.exec_driver_sql(query, (date,))
+            deleted_count = result.rowcount
+            in_transaction = hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None
+            if not in_transaction:
                 conn.commit()
         return deleted_count
     
@@ -946,10 +1059,10 @@ class DatabaseManager:
         """Delete specific snapshot."""
         query = "DELETE FROM portfolio_snapshots WHERE id = ?"
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, (snapshot_id,))
-            deleted_count = cursor.rowcount
-            if not conn.in_transaction:
+            result = conn.exec_driver_sql(query, (snapshot_id,))
+            deleted_count = result.rowcount
+            in_transaction = hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None
+            if not in_transaction:
                 conn.commit()
         return deleted_count
     
@@ -1106,10 +1219,10 @@ class DatabaseManager:
         """Delete old metrics."""
         query = "DELETE FROM performance_metrics WHERE timestamp < ?"
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, (date,))
-            deleted_count = cursor.rowcount
-            if not conn.in_transaction:
+            result = conn.exec_driver_sql(query, (date,))
+            deleted_count = result.rowcount
+            in_transaction = hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None
+            if not in_transaction:
                 conn.commit()
         return deleted_count
     
@@ -1117,10 +1230,10 @@ class DatabaseManager:
         """Delete specific metrics."""
         query = "DELETE FROM performance_metrics WHERE id = ?"
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, (metrics_id,))
-            deleted_count = cursor.rowcount
-            if not conn.in_transaction:
+            result = conn.exec_driver_sql(query, (metrics_id,))
+            deleted_count = result.rowcount
+            in_transaction = hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None
+            if not in_transaction:
                 conn.commit()
         return deleted_count
     
@@ -1143,6 +1256,215 @@ class DatabaseManager:
             }
         
         return comparison
+    
+    # Feature Importance Methods
+    
+    def insert_feature_importance(self, timestamp: str, feature_name: str, 
+                                 importance_score: float, model_id: Optional[str] = None,
+                                 symbol: Optional[str] = None, model_version: Optional[str] = None,
+                                 training_date: Optional[str] = None, metadata: Optional[str] = None) -> int:
+        """
+        Insert a single feature importance record.
+        
+        Args:
+            timestamp: Timestamp for tracking
+            feature_name: Name of the feature
+            importance_score: Importance score
+            model_id: Optional model identifier
+            symbol: Optional symbol
+            model_version: Optional model version
+            training_date: Optional training date
+            metadata: Optional JSON metadata string
+        
+        Returns:
+            ID of inserted record
+        """
+        query = """
+            INSERT INTO feature_importance 
+            (timestamp, feature_name, importance_score, model_id, symbol, model_version, training_date, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        
+        try:
+            with self.get_connection() as conn:
+                result = conn.exec_driver_sql(
+                    query,
+                    (timestamp, feature_name, importance_score, model_id, symbol, 
+                     model_version, training_date, metadata)
+                )
+                in_transaction = hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None
+                if not in_transaction:
+                    conn.commit()
+                return result.lastrowid
+        except Exception as e:
+            self.logger.error(f"Failed to insert feature importance: {str(e)}")
+            raise DatabaseError(f"Failed to insert feature importance: {str(e)}")
+    
+    def insert_feature_importance_batch(self, records: List[Dict]) -> int:
+        """
+        Batch insert feature importance records.
+        
+        Args:
+            records: List of dictionaries with feature importance data
+        
+        Returns:
+            Number of records inserted
+        """
+        if not records:
+            return 0
+        
+        query = """
+            INSERT INTO feature_importance 
+            (timestamp, feature_name, importance_score, model_id, symbol, model_version, training_date, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        
+        try:
+            # Prepare data tuples
+            data_tuples = []
+            for record in records:
+                data_tuples.append((
+                    record.get('timestamp'),
+                    record.get('feature_name'),
+                    record.get('importance_score'),
+                    record.get('model_id'),
+                    record.get('symbol'),
+                    record.get('model_version'),
+                    record.get('training_date'),
+                    record.get('metadata')
+                ))
+            
+            with self.get_connection() as conn:
+                result = conn.exec_driver_sql(query, data_tuples)
+                in_transaction = hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None
+                if not in_transaction:
+                    conn.commit()
+                
+                inserted_count = result.rowcount if hasattr(result, 'rowcount') else len(data_tuples)
+                self.logger.debug(f"Inserted {inserted_count} feature importance records")
+                return inserted_count
+                
+        except Exception as e:
+            self.logger.error(f"Failed to batch insert feature importance: {str(e)}")
+            raise DatabaseError(f"Failed to batch insert feature importance: {str(e)}")
+    
+    def query_feature_importance(self, feature_name: Optional[str] = None,
+                                symbol: Optional[str] = None, model_id: Optional[str] = None,
+                                start_date: Optional[str] = None, end_date: Optional[str] = None,
+                                limit: Optional[int] = None) -> List[Dict]:
+        """
+        Query feature importance with optional filters.
+        
+        Args:
+            feature_name: Optional feature name filter
+            symbol: Optional symbol filter
+            model_id: Optional model ID filter
+            start_date: Optional start date filter
+            end_date: Optional end date filter
+            limit: Optional limit for results
+        
+        Returns:
+            List of dictionaries with feature importance records
+        """
+        query = "SELECT * FROM feature_importance WHERE 1=1"
+        params = []
+        
+        if feature_name:
+            query += " AND feature_name = ?"
+            params.append(feature_name)
+        
+        if symbol:
+            query += " AND symbol = ?"
+            params.append(symbol)
+        
+        if model_id:
+            query += " AND model_id = ?"
+            params.append(model_id)
+        
+        if start_date:
+            query += " AND timestamp >= ?"
+            params.append(start_date)
+        
+        if end_date:
+            query += " AND timestamp <= ?"
+            params.append(end_date)
+        
+        query += " ORDER BY timestamp DESC"
+        
+        if limit:
+            query += f" LIMIT {limit}"
+        
+        try:
+            results = self._execute_query(query, tuple(params) if params else None, fetch=True)
+            return [dict(row) for row in results] if results else []
+        except Exception as e:
+            self.logger.error(f"Failed to query feature importance: {str(e)}")
+            return []
+    
+    def get_latest_feature_importance(self, symbol: Optional[str] = None,
+                                     model_id: Optional[str] = None, n: int = 100) -> List[Dict]:
+        """
+        Get most recent feature importance records.
+        
+        Args:
+            symbol: Optional symbol filter
+            model_id: Optional model ID filter
+            n: Number of records to return
+        
+        Returns:
+            List of dictionaries with recent feature importance records
+        """
+        return self.query_feature_importance(symbol=symbol, model_id=model_id, limit=n)
+    
+    def get_feature_importance_history(self, feature_name: str, symbol: Optional[str] = None,
+                                      days: int = 90) -> List[Dict]:
+        """
+        Get historical importance scores for a specific feature.
+        
+        Args:
+            feature_name: Name of the feature
+            symbol: Optional symbol filter
+            days: Number of days to look back
+        
+        Returns:
+            List of dictionaries with historical importance records
+        """
+        end_date = datetime.now().isoformat()
+        start_date = (datetime.now() - timedelta(days=days)).isoformat()
+        
+        return self.query_feature_importance(
+            feature_name=feature_name,
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date
+        )
+    
+    def delete_old_feature_importance(self, days: int = 90) -> int:
+        """
+        Delete feature importance records older than N days.
+        
+        Args:
+            days: Number of days to keep
+        
+        Returns:
+            Number of records deleted
+        """
+        cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+        query = "DELETE FROM feature_importance WHERE timestamp < ?"
+        
+        try:
+            with self.get_connection() as conn:
+                result = conn.exec_driver_sql(query, (cutoff_date,))
+                deleted_count = result.rowcount
+                in_transaction = hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None
+                if not in_transaction:
+                    conn.commit()
+                
+                self.logger.info(f"Deleted {deleted_count} old feature importance records")
+                return deleted_count
+        except Exception as e:
+            self.logger.error(f"Failed to delete old feature importance: {str(e)}")
+            return 0
     
     def get_metrics_trend(self, metric_name: str, period: str = 'daily',
                          limit: int = 30) -> List[Dict]:
@@ -1354,6 +1676,192 @@ class DatabaseManager:
         results = self._execute_query(query, tuple(params) if params else None, fetch=True)
         return [(row['month'], row['monthly_pnl'] or 0.0) for row in results]
     
+    # Feature Importance CRUD Operations
+    
+    def insert_feature_importance(self, timestamp: str, feature_name: str, 
+                                 importance_score: float, model_id: Optional[str] = None,
+                                 symbol: Optional[str] = None, model_version: Optional[str] = None,
+                                 training_date: Optional[str] = None, metadata: Optional[str] = None) -> int:
+        """
+        Insert a single feature importance record.
+        
+        Args:
+            timestamp: Timestamp for tracking
+            feature_name: Name of the feature
+            importance_score: Importance score (0-1)
+            model_id: Optional model identifier
+            symbol: Optional trading symbol
+            model_version: Optional model version
+            training_date: Optional training date
+            metadata: Optional JSON metadata string
+        
+        Returns:
+            Record ID
+        """
+        query = """
+            INSERT INTO feature_importance (
+                timestamp, feature_name, importance_score, model_id,
+                symbol, model_version, training_date, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        
+        params = (timestamp, feature_name, importance_score, model_id,
+                 symbol, model_version, training_date, metadata)
+        
+        record_id = self._execute_query(query, params)
+        self.logger.debug(f"Feature importance inserted: {feature_name} (ID: {record_id})")
+        return record_id
+    
+    def insert_feature_importance_batch(self, records: List[Dict]) -> int:
+        """
+        Batch insert feature importance records.
+        
+        Args:
+            records: List of dictionaries with feature importance data
+        
+        Returns:
+            Number of records inserted
+        """
+        if not records:
+            return 0
+        
+        query = """
+            INSERT INTO feature_importance (
+                timestamp, feature_name, importance_score, model_id,
+                symbol, model_version, training_date, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        
+        try:
+            with self.transaction():
+                inserted = 0
+                for record in records:
+                    params = (
+                        record.get('timestamp'),
+                        record.get('feature_name'),
+                        record.get('importance_score'),
+                        record.get('model_id'),
+                        record.get('symbol'),
+                        record.get('model_version'),
+                        record.get('training_date'),
+                        record.get('metadata')
+                    )
+                    self._execute_query(query, params, commit=False)
+                    inserted += 1
+                
+                self.logger.info(f"Batch inserted {inserted} feature importance records")
+                return inserted
+        except Exception as e:
+            self.logger.error(f"Batch insert failed: {str(e)}")
+            raise
+    
+    def query_feature_importance(self, feature_name: Optional[str] = None,
+                                symbol: Optional[str] = None, model_id: Optional[str] = None,
+                                start_date: Optional[str] = None, end_date: Optional[str] = None,
+                                limit: Optional[int] = None) -> List[Dict]:
+        """
+        Query feature importance records with filters.
+        
+        Args:
+            feature_name: Filter by feature name
+            symbol: Filter by symbol
+            model_id: Filter by model ID
+            start_date: Filter by start date
+            end_date: Filter by end date
+            limit: Maximum number of records to return
+        
+        Returns:
+            List of feature importance records
+        """
+        conditions = []
+        params = []
+        
+        if feature_name:
+            conditions.append("feature_name = ?")
+            params.append(feature_name)
+        
+        if symbol:
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        
+        if model_id:
+            conditions.append("model_id = ?")
+            params.append(model_id)
+        
+        if start_date:
+            conditions.append("timestamp >= ?")
+            params.append(start_date)
+        
+        if end_date:
+            conditions.append("timestamp <= ?")
+            params.append(end_date)
+        
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+        limit_clause = f"LIMIT {limit}" if limit else ""
+        
+        query = f"SELECT * FROM feature_importance {where_clause} ORDER BY timestamp DESC {limit_clause}"
+        
+        results = self._execute_query(query, tuple(params) if params else None, fetch=True)
+        return [dict(row) for row in results]
+    
+    def get_latest_feature_importance(self, symbol: Optional[str] = None,
+                                     model_id: Optional[str] = None, n: int = 1) -> List[Dict]:
+        """
+        Get latest feature importance records.
+        
+        Args:
+            symbol: Optional symbol filter
+            model_id: Optional model ID filter
+            n: Number of latest records
+        
+        Returns:
+            List of latest feature importance records
+        """
+        return self.query_feature_importance(symbol=symbol, model_id=model_id, limit=n)
+    
+    def get_feature_importance_history(self, feature_name: str, symbol: Optional[str] = None,
+                                      days: int = 90) -> List[Dict]:
+        """
+        Get feature importance history for a specific feature.
+        
+        Args:
+            feature_name: Name of feature
+            symbol: Optional symbol filter
+            days: Number of days to look back
+        
+        Returns:
+            List of historical importance records
+        """
+        start_date = (datetime.now() - timedelta(days=days)).isoformat()
+        return self.query_feature_importance(
+            feature_name=feature_name,
+            symbol=symbol,
+            start_date=start_date
+        )
+    
+    def delete_old_feature_importance(self, days: int = 90) -> int:
+        """
+        Delete old feature importance records.
+        
+        Args:
+            days: Delete records older than this many days
+        
+        Returns:
+            Number of records deleted
+        """
+        cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+        query = "DELETE FROM feature_importance WHERE timestamp < ?"
+        
+        with self.get_connection() as conn:
+            result = conn.exec_driver_sql(query, (cutoff_date,))
+            deleted_count = result.rowcount
+            in_transaction = hasattr(self._transaction_local, 'connection') and self._transaction_local.connection is not None
+            if not in_transaction:
+                conn.commit()
+        
+        self.logger.info(f"Deleted {deleted_count} old feature importance records")
+        return deleted_count
+    
     # Database Maintenance and Backup
     
     def create_backup(self, backup_path: str = None) -> str:
@@ -1372,9 +1880,14 @@ class DatabaseManager:
         
         try:
             with self.get_connection() as conn:
+                # Access raw sqlite3 connection from SQLAlchemy connection
+                # SQLAlchemy Connection wraps DBAPI connection, which wraps sqlite3.Connection
+                # For SQLite: connection.connection.connection gives us the actual sqlite3.Connection
+                raw_conn = conn.connection.connection
+                
                 # Use backup API for SQLite
                 backup_conn = sqlite3.connect(backup_path)
-                conn.backup(backup_conn)
+                raw_conn.backup(backup_conn)
                 backup_conn.close()
             
             self.logger.info(f"Database backup created: {backup_path}")
@@ -1391,7 +1904,8 @@ class DatabaseManager:
         """Optimize database and reclaim space."""
         try:
             with self.get_connection() as conn:
-                conn.execute("VACUUM")
+                conn.execute(text("VACUUM"))
+                conn.commit()
             self.logger.info("Database vacuum completed")
         except Exception as e:
             self.logger.error(f"Vacuum failed: {str(e)}")
@@ -1401,7 +1915,8 @@ class DatabaseManager:
         """Update query optimizer statistics."""
         try:
             with self.get_connection() as conn:
-                conn.execute("ANALYZE")
+                conn.execute(text("ANALYZE"))
+                conn.commit()
             self.logger.info("Database analysis completed")
         except Exception as e:
             self.logger.error(f"Analysis failed: {str(e)}")
@@ -1411,7 +1926,7 @@ class DatabaseManager:
         """Check database integrity."""
         try:
             with self.get_connection() as conn:
-                result = conn.execute("PRAGMA integrity_check").fetchone()
+                result = conn.execute(text("PRAGMA integrity_check")).fetchone()
                 integrity_ok = result[0] == 'ok'
                 
                 if integrity_ok:
@@ -1434,7 +1949,7 @@ class DatabaseManager:
     
     def get_table_row_counts(self) -> Dict[str, int]:
         """Get row counts for all tables."""
-        tables = ['trades', 'positions', 'portfolio_snapshots', 'performance_metrics']
+        tables = ['trades', 'positions', 'portfolio_snapshots', 'performance_metrics', 'feature_importance']
         counts = {}
         
         for table in tables:
@@ -1492,13 +2007,13 @@ class DatabaseManager:
     
     def validate_schema(self) -> bool:
         """Verify all required tables and indexes exist."""
-        required_tables = ['trades', 'positions', 'portfolio_snapshots', 'performance_metrics']
+        required_tables = ['trades', 'positions', 'portfolio_snapshots', 'performance_metrics', 'feature_importance']
         
         try:
             with self.get_connection() as conn:
                 for table in required_tables:
                     query = f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"
-                    result = conn.execute(query).fetchone()
+                    result = conn.execute(text(query)).fetchone()
                     if not result:
                         self.logger.error(f"Missing table: {table}")
                         return False
@@ -1511,21 +2026,14 @@ class DatabaseManager:
     
     def close(self):
         """
-        Close the current thread's database connection.
+        Close all database connections in the pool.
         
-        Note: This method only closes the connection for the current thread.
-        Other threads' connections remain open until their threads terminate.
-        This is a limitation of the thread-local connection approach.
-        
-        For applications with multiple threads, consider calling close() from
-        each thread, or ensure threads terminate cleanly to allow SQLite to
-        close connections automatically.
+        This disposes the SQLAlchemy engine and closes all connections
+        in the connection pool, regardless of which thread they were used in.
         """
         try:
-            if hasattr(self._local, 'connection') and self._local.connection:
-                self._local.connection.close()
-                self._local.connection = None
-            self.logger.info("Database connection closed for current thread")
+            self.engine.dispose()
+            self.logger.info("Database connection pool disposed")
         except Exception as e:
-            self.logger.error(f"Error closing connection: {str(e)}")
+            self.logger.error(f"Error disposing connection pool: {str(e)}")
 

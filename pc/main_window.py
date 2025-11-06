@@ -268,10 +268,6 @@ class MainWindow(QMainWindow):
         # === Tools Menu ===
         tools_menu = menubar.addMenu("Tools")
         
-        open_comfyui_action = QAction("Open ComfyUI", self)
-        open_comfyui_action.triggered.connect(self._placeholder_open_comfyui)
-        tools_menu.addAction(open_comfyui_action)
-        
         save_snapshot_action = QAction("Save Snapshot", self)
         save_snapshot_action.triggered.connect(self._placeholder_save_snapshot)
         tools_menu.addAction(save_snapshot_action)
@@ -677,11 +673,10 @@ class MainWindow(QMainWindow):
             "<p><b>Version:</b> 1.0.0</p>"
             "<p><b>Description:</b> Desktop application for managing GPU instances on Novita.ai platform.</p>"
             "<p>Provides streamlined interface for creating, managing, and monitoring cloud GPU instances "
-            "with ComfyUI integration.</p>"
+            "for AI/ML workloads.</p>"
             "<p><b>Features:</b></p>"
             "<ul>"
             "<li>GPU instance lifecycle management</li>"
-            "<li>ComfyUI integration</li>"
             "<li>Real-time monitoring</li>"
             "<li>Snapshot and template system</li>"
             "</ul>"
@@ -1177,11 +1172,6 @@ class MainWindow(QMainWindow):
         """Re-enable instance action buttons based on selection."""
         # This will trigger _on_instance_selected which sets proper states
         self._on_instance_selected()
-    
-    def _placeholder_open_comfyui(self):
-        """Placeholder for open ComfyUI functionality."""
-        self.log_message("Feature coming in Phase 4: Open ComfyUI", "INFO")
-        QMessageBox.information(self, "Coming Soon", "ComfyUI integration will be available in Phase 4.")
     
     def _placeholder_save_snapshot(self):
         """Placeholder for save snapshot functionality."""

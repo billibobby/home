@@ -31,6 +31,20 @@ trading:
   default_order_type: "limit"  # market, limit, stop_loss, stop_limit
   slippage_tolerance: 0.1  # Percentage
 
+# Paper Trading Configuration
+paper_trading:
+  enabled: true  # Toggle paper trading mode
+  initial_balance: 10000.0  # Starting cash balance for paper trading (USD)
+  commission: 0.1  # Trading commission as percentage (0.1 = 0.1%)
+  slippage:
+    enabled: true  # Toggle slippage simulation
+    min_percentage: 0.01  # Minimum slippage (0.01 = 0.01%)
+    max_percentage: 0.1  # Maximum slippage (0.1 = 0.1%)
+    market_order_slippage: 0.2  # Higher slippage for market orders (0.2 = 0.2%)
+  execution_delay_ms: 100  # Simulated order execution delay in milliseconds (100-500ms)
+  partial_fills: false  # Enable/disable partial fill simulation
+  reset_on_startup: false  # Whether to reset portfolio on application startup
+
 # Model Settings
 models:
   default_model: "random_forest"  # Model type to use
@@ -64,6 +78,58 @@ models:
       - 'BB_lower'
     volatility_window: 20  # Rolling window for volatility calculation
     scaling_method: 'standard'  # Feature scaling method (standard, minmax, robust)
+    
+    # Multi-source feature engineering
+    multi_source_enabled: false  # Enable multi-source feature creation
+    sentiment_enabled: false  # Enable sentiment features
+    sequence_length: 60  # Sequence length for LSTM (in time periods, e.g., 60 minutes for 1m data)
+    
+    # Cross-asset features to create
+    cross_asset_features:
+      - 'price_ratio'  # QQQ/SPY price ratio
+      - 'correlation'  # Rolling correlation between assets
+      - 'relative_strength'  # Relative performance metrics
+    
+    # Sentiment features
+    sentiment_features:
+      - 'sentiment_score'  # Raw sentiment score
+      - 'sentiment_momentum'  # Change in sentiment over time
+      - 'sentiment_divergence'  # Sentiment vs price direction divergence
+    
+    # Alpha feature engineering (advanced features for higher returns)
+    use_alpha_features: false  # Set to true to enable advanced features
+    enable_profiling: false  # Enable performance profiling for feature generation (for debugging)
+    alpha_feature_groups:  # Feature groups to generate
+      - microstructure  # Spread, VWAP, price impact, order flow
+      - regime  # Volatility regime, trend strength, Hurst exponent
+      - momentum  # Multi-timeframe momentum and acceleration
+      - volume  # OBV, volume-price trend, volume divergence
+      - relative_strength  # Market-relative and sector-relative performance
+      - time_based  # Day of week, month-end effects
+    
+    # Market data for relative strength features
+    market_benchmark: 'SPY'  # Market index for relative performance
+    sector_etfs:  # Sector ETF mappings for sector-relative features
+      technology: 'XLK'
+      finance: 'XLF'
+      healthcare: 'XLV'
+      energy: 'XLE'
+      consumer_discretionary: 'XLY'
+      consumer_staples: 'XLP'
+      industrials: 'XLI'
+      materials: 'XLB'
+      utilities: 'XLU'
+      real_estate: 'XLRE'
+      communication: 'XLC'
+    
+    # Feature selection configuration
+    feature_selection:
+      enabled: false  # Enable automatic feature selection
+      method: 'importance'  # Options: importance, correlation, forward, backward, combined
+      importance_threshold: 0.01  # Minimum importance to keep feature
+      correlation_threshold: 0.95  # Remove features with correlation above this
+      max_features: 50  # Maximum number of features to select
+      cv_folds: 5  # Cross-validation folds for selection
   
   # XGBoost Model Configuration
   xgboost:
@@ -80,6 +146,69 @@ models:
     n_estimators: 100
     subsample: 0.8
     colsample_bytree: 0.8
+  
+  # Hyperparameter Optimization Configuration
+  optimization:
+    enabled: true
+    n_trials: 100
+    timeout_seconds: 3600  # 1 hour max
+    objective: 'sharpe'  # sharpe, sortino, returns, calmar, custom
+    
+    # Early stopping configuration
+    early_stopping:
+      enabled: true
+      patience: 10  # Stop if no improvement for 10 trials
+      min_delta: 0.01  # Minimum improvement threshold
+    
+    # Pruning configuration
+    pruning:
+      enabled: true
+      warmup_steps: 10  # Number of steps before pruning starts
+      n_startup_trials: 5  # Number of trials before pruner activates
+    
+    # Parameter search ranges
+    parameter_ranges:
+      max_depth: [3, 10]
+      learning_rate: [0.001, 0.3]
+      n_estimators: [50, 500]
+      subsample: [0.6, 1.0]
+      colsample_bytree: [0.6, 1.0]
+      min_child_weight: [1, 10]
+      gamma: [0, 5.0]
+      reg_alpha: [0, 10.0]
+      reg_lambda: [0, 10.0]
+    
+    # Ensemble optimization
+    ensemble:
+      enabled: false
+      n_models: 5
+      diversity_weight: 0.1
+    
+    # Distributed optimization
+    distributed:
+      enabled: false
+      n_workers: 4
+      storage: 'sqlite:///optuna.db'
+    
+    # Monitoring and checkpointing
+    monitoring:
+      checkpoint_interval: 10  # Save every N trials
+      checkpoint_dir: 'optimization_checkpoints'
+      save_plots: true
+      plot_dir: 'optimization_plots'
+    
+    # Notifications
+    notifications:
+      enabled: false
+      email:
+        enabled: false
+        smtp_server: 'smtp.gmail.com'
+        smtp_port: 587
+        from_address: ''
+        to_address: ''
+      slack:
+        enabled: false
+        webhook_url: ''
 
 # Data Settings
 data:
@@ -113,6 +242,28 @@ data:
   stock_data_source: 'yfinance'  # Data source for stocks
   cache_historical_data: true  # Cache downloaded data
   historical_data_path: 'data/historical/'  # Path for cached data
+  
+  # Multi-source data configuration
+  multi_source:
+    enabled: false  # Toggle multi-source data fetching
+    symbols:  # Symbols to fetch for multi-source analysis
+      - 'QQQ'  # Primary trading symbol
+      - 'SPY'  # Market benchmark
+      - 'VXX'  # Volatility index
+    default_interval: '5m'  # Default interval for multi-source data (1m, 5m, 15m, 30m, 1h, 1d)
+  
+  # Cache strategy configuration
+  cache_strategy: 'full'  # Options: 'full', 'rolling_window', 'disabled'
+  cache_window_days: 60  # For rolling_window strategy: number of days to keep
+  
+  # Sentiment data configuration
+  sentiment:
+    enabled: false  # Toggle sentiment data fetching
+    primary_source: 'finnhub'  # Primary sentiment source: 'finnhub' or 'alpha_vantage'
+    fallback_enabled: true  # Use fallback source if primary fails
+    cache_ttl_hours: 1  # Sentiment cache time-to-live in hours
+    lookback_days: 7  # Number of days of sentiment history to fetch
+    sentiment_cache_path: 'data/sentiment/'  # Path for sentiment cache
 
 # API Settings
 api:
@@ -136,14 +287,50 @@ api:
       enabled: false
       testnet: true
     alpaca:
-      enabled: false
-      paper_trading: true  # Use paper trading for stocks
+      enabled: false  # DEPRECATED: Use exchanges.alpaca.enabled instead
+      paper_trading: true  # DEPRECATED: Use exchanges.alpaca.paper_trading instead
+
+# Exchange Configuration
+exchanges:
+  alpaca:
+    enabled: false  # Set to true to use Alpaca instead of paper trading
+    paper_trading: true  # Use paper trading API (true) or live trading (false)
+    
+    # API Endpoints
+    base_url: 'https://paper-api.alpaca.markets'  # Paper trading URL
+    # base_url: 'https://api.alpaca.markets'  # Live trading URL (uncomment for live)
+    data_url: 'https://data.alpaca.markets'
+    stream_url: 'wss://stream.data.alpaca.markets/v2/iex'
+    
+    # Rate Limiting
+    rate_limit:
+      requests_per_minute: 200
+      requests_per_second: 10
+    
+    # Order Defaults
+    default_time_in_force: 'day'  # day, gtc, ioc, fok
+    default_order_type: 'market'  # market, limit, stop, stop_limit
+    
+    # Streaming
+    streaming:
+      enabled: false  # Enable real-time data streaming
+      auto_reconnect: true
+      reconnect_delay_seconds: 5
+    
+    # Market Hours
+    respect_market_hours: true  # Only trade during market hours
+    extended_hours: false  # Allow extended hours trading
 
 # Database Settings
 database:
   type: "sqlite"  # sqlite, postgresql, mysql
+  path: "data/trading_bot.db"  # explicit database path (relative or absolute)
   backup_enabled: true
   backup_interval_hours: 24
+  backup_retention_days: 30  # how long to keep backup files
+  connection_pool_size: 5  # number of connections in pool
+  timeout_seconds: 30  # database operation timeout
+  enable_wal_mode: true  # enable Write-Ahead Logging for better concurrency
 
 # Notification Settings (Future feature)
 notifications:
@@ -158,4 +345,51 @@ monitoring:
   enabled: true
   metrics_interval_seconds: 60
   save_metrics: true
+
+# Backtesting Configuration
+backtesting:
+  # Walk-forward parameters
+  walk_forward:
+    train_period_days: 252  # 1 year training window
+    test_period_days: 21    # 1 month testing window
+    step_size_days: 21      # Roll forward monthly
+    retrain_frequency_days: 21  # Retrain monthly
+    min_data_points: 252    # Minimum data needed to start backtest
+  
+  # Transaction cost modeling
+  transaction_costs:
+    commission_pct: 0.001   # 0.1% commission per trade
+    slippage_bps: 5         # 5 basis points slippage
+    spread_bps: 2           # 2 basis points bid-ask spread
+    market_impact_enabled: true
+    market_impact_coeff: 0.01  # Market impact coefficient
+  
+  # Validation criteria (for model deployment)
+  validation:
+    min_sharpe_ratio: 1.5   # Minimum Sharpe ratio to pass
+    max_drawdown_pct: 15    # Maximum drawdown percentage
+    min_win_rate: 0.50      # Minimum win rate (50%)
+    min_trades: 100         # Minimum number of trades
+    min_positive_periods: 0.60  # 60% of periods must be positive
+    raise_on_failure: false  # Raise exception if validation fails
+  
+  # Reporting and output
+  reporting:
+    save_trades: true       # Save individual trades to file
+    save_equity_curve: true # Save equity curve data
+    generate_html_report: true  # Auto-generate HTML report
+    output_directory: 'backtest_results/'  # Output directory
+    save_plots: true        # Save plots to files
+    plot_format: 'png'      # Plot format (png, svg, pdf)
+  
+  # Robustness testing
+  robustness:
+    enabled: false          # Enable robustness tests
+    parameter_sensitivity: true
+    time_period_stability: true
+    feature_stability: true
+    monte_carlo_simulations: 1000
+  
+  # Risk-free rate for metrics (annual)
+  risk_free_rate: 0.02      # 2% annual risk-free rate
 

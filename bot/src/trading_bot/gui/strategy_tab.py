@@ -53,6 +53,12 @@ class StrategyMonitor(QWidget):
         header_label.setFont(QFont("Arial", 14, QFont.Bold))
         layout.addWidget(header_label)
         
+        # Exchange info
+        exchange_label = QLabel("Exchange: Not initialized")
+        exchange_label.setFont(QFont("Arial", 10))
+        self.exchange_label = exchange_label
+        layout.addWidget(exchange_label)
+        
         # Performance metrics
         metrics_group = QGroupBox("Performance Metrics")
         metrics_layout = QHBoxLayout()
@@ -169,6 +175,21 @@ class StrategyMonitor(QWidget):
         self.strategy = strategy
         self.analyze_button.setEnabled(True)
         self.status_label.setText("✅ Strategy initialized")
+        
+        # Update exchange display
+        if hasattr(strategy, 'exchange') and strategy.exchange:
+            exchange_name = strategy.exchange.get_exchange_name()
+            self.exchange_label.setText(f"Exchange: {exchange_name}")
+            
+            # Check if market is open (for live exchanges)
+            if hasattr(strategy.exchange, 'is_market_open'):
+                try:
+                    is_open = strategy.exchange.is_market_open()
+                    market_status = "🟢 Open" if is_open else "🔴 Closed"
+                    self.exchange_label.setText(f"Exchange: {exchange_name} | Market: {market_status}")
+                except Exception:
+                    pass
+        
         self._refresh_display()
     
     def _refresh_display(self):
@@ -216,6 +237,18 @@ class StrategyMonitor(QWidget):
             
             self.signals_table.resizeColumnsToContents()
             
+            # Update market status for live exchanges
+            if hasattr(self.strategy, 'exchange') and self.strategy.exchange:
+                if hasattr(self.strategy.exchange, 'is_market_open'):
+                    try:
+                        is_open = self.strategy.exchange.is_market_open()
+                        exchange_name = self.strategy.exchange.get_exchange_name()
+                        market_status = "🟢 Open" if is_open else "🔴 Closed"
+                        self.exchange_label.setText(f"Exchange: {exchange_name} | Market: {market_status}")
+                    except Exception as e:
+                        if hasattr(self, 'logger'):
+                            self.logger.warning(f"Failed to check market status: {e}")
+            
         except Exception as e:
             self.status_label.setText(f"❌ Error: {str(e)}")
     
@@ -231,6 +264,20 @@ class StrategyMonitor(QWidget):
         
         if ok and symbol:
             try:
+                # Check if market is open for live trading
+                if hasattr(self.strategy, 'exchange') and self.strategy.exchange:
+                    if hasattr(self.strategy.exchange, 'is_market_open'):
+                        if not self.strategy.exchange.is_market_open():
+                            reply = QMessageBox.question(
+                                self,
+                                "Market Closed",
+                                "Market is currently closed. Continue with analysis?",
+                                QMessageBox.Yes | QMessageBox.No,
+                                QMessageBox.No
+                            )
+                            if reply == QMessageBox.No:
+                                return
+                
                 self.status_label.setText(f"Analyzing {symbol}...")
                 
                 # Run analysis

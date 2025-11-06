@@ -13,6 +13,8 @@ from typing import Optional
 
 from trading_bot.app import BotApp, BotStatus
 from trading_bot.logger import UILogHandler
+from trading_bot.exchanges import create_exchange
+from trading_bot.data import DatabaseManager
 
 # Check for PySide6 availability
 try:
@@ -74,10 +76,15 @@ class MainWindow(QMainWindow):
         self.log_signals = LogSignals()
         self.logger = logging.getLogger(__name__)
         
+        # Exchange and database
+        self.exchange = None
+        self.db_manager = None
+        
         # Initialize tabs as None first
         self.model_tab = None
         self.predictions_tab = None
         self.strategy_tab = None
+        self.backtesting_tab = None
         
         self._init_ui()
         self._setup_log_handler()
@@ -101,10 +108,22 @@ class MainWindow(QMainWindow):
         
         # Create status display
         status_group = QGroupBox("Bot Status")
-        status_layout = QHBoxLayout()
+        status_layout = QVBoxLayout()
+        
+        # Status label
+        status_row = QHBoxLayout()
         self.status_label = QLabel("Status: Initializing...")
         self.status_label.setFont(QFont("Arial", 12, QFont.Bold))
-        status_layout.addWidget(self.status_label)
+        status_row.addWidget(self.status_label)
+        status_layout.addLayout(status_row)
+        
+        # Exchange mode label
+        exchange_row = QHBoxLayout()
+        self.exchange_mode_label = QLabel("Exchange: Initializing...")
+        self.exchange_mode_label.setFont(QFont("Arial", 10))
+        exchange_row.addWidget(self.exchange_mode_label)
+        status_layout.addLayout(exchange_row)
+        
         status_group.setLayout(status_layout)
         main_layout.addWidget(status_group)
         
@@ -155,6 +174,15 @@ class MainWindow(QMainWindow):
         except ImportError as e:
             self.strategy_tab = None
             self.logger.warning(f"Could not load strategy tab: {e}")
+        
+        # Backtesting tab
+        try:
+            from trading_bot.gui.backtesting_tab import BacktestingTab
+            self.backtesting_tab = BacktestingTab(None)  # Will be set after bot init
+            self.tab_widget.addTab(self.backtesting_tab, "📈 Backtesting")
+        except ImportError as e:
+            self.backtesting_tab = None
+            self.logger.warning(f"Could not load backtesting tab: {e}")
         
         # Log display tab
         log_widget = QWidget()
@@ -243,6 +271,18 @@ class MainWindow(QMainWindow):
                     ui_handler.setLevel(logging.INFO)
                     logger.addHandler(ui_handler)
                 
+                # Initialize database manager
+                config = self.bot_app.get_config()
+                try:
+                    self.db_manager = DatabaseManager(config, logger)
+                    
+                    # Create exchange instance
+                    self.exchange = create_exchange(config, logger, self.db_manager)
+                    logger.info(f"Exchange initialized: {self.exchange.get_exchange_name()}")
+                except Exception as e:
+                    logger.error(f"Failed to initialize exchange: {str(e)}")
+                    # Continue without exchange - paper trading will be unavailable
+                
                 # Set bot_app reference in tabs
                 if self.model_tab:
                     self.model_tab.bot_app = self.bot_app
@@ -253,6 +293,9 @@ class MainWindow(QMainWindow):
                 
                 if self.strategy_tab:
                     self.strategy_tab.bot_app = self.bot_app
+                
+                if self.backtesting_tab:
+                    self.backtesting_tab.bot_app = self.bot_app
         
         init_thread = threading.Thread(target=init_worker, daemon=True)
         init_thread.start()
@@ -307,6 +350,23 @@ class MainWindow(QMainWindow):
         # Update status label
         status_text = f"Status: {status.value.capitalize()}"
         self.status_label.setText(status_text)
+        
+        # Update exchange mode label
+        if self.exchange:
+            exchange_name = self.exchange.get_exchange_name()
+            if 'paper' in exchange_name and 'alpaca' not in exchange_name:
+                mode_text = "Exchange: 📝 Paper Trading"
+                self.exchange_mode_label.setStyleSheet("color: blue;")
+            elif 'alpaca' in exchange_name:
+                if 'paper' in exchange_name:
+                    mode_text = "Exchange: 🔵 Alpaca (Paper)"
+                    self.exchange_mode_label.setStyleSheet("color: green;")
+                else:
+                    mode_text = "Exchange: 🔴 Alpaca (LIVE)"
+                    self.exchange_mode_label.setStyleSheet("color: red; font-weight: bold;")
+            else:
+                mode_text = f"Exchange: {exchange_name}"
+            self.exchange_mode_label.setText(mode_text)
         
         # Update button states
         if status == BotStatus.READY:
@@ -369,7 +429,7 @@ class MainWindow(QMainWindow):
                         logger = self.bot_app.get_logger()
                         
                         signal_gen = SignalGenerator(config, logger)
-                        strategy = XGBoostStrategy(config, logger, predictor, signal_gen)
+                        strategy = XGBoostStrategy(config, logger, predictor, signal_gen, exchange=self.exchange)
                         
                         self.strategy_tab.set_strategy(strategy)
                     except Exception as e:
@@ -393,6 +453,12 @@ class MainWindow(QMainWindow):
             else:
                 event.ignore()
         else:
+            # Cleanup exchange
+            if self.exchange:
+                # Stop streaming if active
+                if hasattr(self.exchange, 'stop_streaming'):
+                    self.exchange.stop_streaming()
+            
             if self.bot_app:
                 self.bot_app.shutdown()
             event.accept()

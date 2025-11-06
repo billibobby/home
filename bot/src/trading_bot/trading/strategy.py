@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 from trading_bot.data import StockDataFetcher, FeatureEngineer
 from trading_bot.models import XGBoostPredictor
 from trading_bot.trading.signal_generator import SignalGenerator, SignalType
+from trading_bot.exchanges import ExchangeInterface
 
 
 class XGBoostStrategy:
@@ -20,7 +21,7 @@ class XGBoostStrategy:
     """
     
     def __init__(self, config, logger, predictor: XGBoostPredictor, 
-                 signal_generator: SignalGenerator, paper_trading_engine=None):
+                 signal_generator: SignalGenerator, exchange: Optional[ExchangeInterface] = None):
         """
         Initialize the XGBoost trading strategy.
         
@@ -29,13 +30,13 @@ class XGBoostStrategy:
             logger: Logger instance
             predictor: XGBoost predictor instance
             signal_generator: Signal generator instance
-            paper_trading_engine: Optional PaperTradingEngine instance for paper trading
+            exchange: Optional ExchangeInterface instance for order execution
         """
         self.config = config
         self.logger = logger
         self.predictor = predictor
         self.signal_generator = signal_generator
-        self.paper_trading_engine = paper_trading_engine
+        self.exchange = exchange
         
         # Initialize dependencies
         self.data_fetcher = StockDataFetcher(config, logger)
@@ -52,11 +53,12 @@ class XGBoostStrategy:
         self.active_positions = {}
         self.signal_history = []
         
-        # Log paper trading status
-        if paper_trading_engine and config.get('paper_trading.enabled', False):
-            self.logger.info("XGBoost strategy initialized with paper trading enabled")
+        # Log exchange status
+        if exchange:
+            exchange_name = exchange.get_exchange_name()
+            self.logger.info(f"XGBoost strategy initialized with exchange: {exchange_name}")
         else:
-            self.logger.info("XGBoost strategy initialized")
+            self.logger.info("XGBoost strategy initialized (no exchange configured)")
     
     def analyze(self, symbol: str, account_balance: float = None) -> Optional[Dict]:
         """
@@ -350,9 +352,9 @@ class XGBoostStrategy:
             'take_profit': entry_price * (1 + self.take_profit_pct / 100)
         }
         
-        # Sync with paper trading engine if available
-        if self.paper_trading_engine:
-            # Position is already tracked in paper trading engine after execution
+        # Sync with exchange if available
+        if self.exchange:
+            # Position is already tracked in exchange after execution
             # This is just for consistency
             pass
         
@@ -367,12 +369,12 @@ class XGBoostStrategy:
             current_price: Current market price (required for paper trading)
         """
         if symbol in self.active_positions:
-            # If paper trading engine exists, close position there first
-            if self.paper_trading_engine:
+            # If exchange exists, close position there first
+            if self.exchange:
                 if current_price is None:
-                    self.logger.warning(f"Current price required to close position in paper trading, but not provided for {symbol}")
+                    self.logger.warning(f"Current price required to close position in exchange, but not provided for {symbol}")
                 else:
-                    self.paper_trading_engine.close_position(symbol, current_price, reason='manual')
+                    self.exchange.close_position(symbol, current_price, reason='manual')
             
             del self.active_positions[symbol]
             self.logger.info(f"Position closed: {symbol}")
@@ -410,11 +412,11 @@ class XGBoostStrategy:
         Returns:
             Execution result dictionary
         """
-        if self.paper_trading_engine is None:
-            self.logger.warning("Paper trading engine not available - cannot execute decision")
+        if self.exchange is None:
+            self.logger.warning("Exchange not available - cannot execute decision")
             return {
                 'success': False,
-                'error': 'Paper trading engine not available'
+                'error': 'Exchange not available'
             }
         
         try:
@@ -446,28 +448,43 @@ class XGBoostStrategy:
                 position_size = decision.get('position_size')
                 if position_size is None:
                     # Use current balance if available
-                    account_summary = self.paper_trading_engine.get_account_summary()
+                    account_summary = self.exchange.get_account_summary()
                     account_balance = account_summary.get('cash_balance', 0)
                     position_size = account_balance * (self.position_size_pct / 100)
                 
                 quantity = position_size / current_price if current_price > 0 else 0
                 
-                result = self.paper_trading_engine.execute_buy_order(
-                    symbol, quantity, current_price, order_type='market', signal=signal
+                # For paper trading, pass current_price as limit_price (even for market orders)
+                # This is needed because paper trading engine requires a price for simulation
+                result = self.exchange.place_order(
+                    symbol, quantity, 'buy', 'market', 'day', current_price
                 )
             else:  # sell
-                # For SELL, look up actual holdings
-                position = self.paper_trading_engine.get_position(symbol)
+                # For SELL, refresh position from exchange (avoid relying on cached value)
+                position = self.exchange.get_position(symbol)
                 if position is None:
+                    # Position doesn't exist, clear from active_positions if present
+                    self.active_positions.pop(symbol, None)
                     return {
                         'success': False,
                         'error': f'No position found for {symbol} to sell'
                     }
                 
+                # Get current quantity from exchange
                 quantity = position['quantity']
                 
-                result = self.paper_trading_engine.execute_sell_order(
-                    symbol, quantity, current_price, order_type='market', signal=signal
+                # Validate quantity is positive
+                if quantity <= 0:
+                    self.active_positions.pop(symbol, None)
+                    return {
+                        'success': False,
+                        'error': f'Invalid position quantity for {symbol}: {quantity}'
+                    }
+                
+                # For paper trading, pass current_price as limit_price (even for market orders)
+                # The paper exchange will use position price if current_price not provided
+                result = self.exchange.place_order(
+                    symbol, quantity, 'sell', 'market', 'day', current_price
                 )
             
             # Update in-memory position tracking if successful
@@ -479,8 +496,16 @@ class XGBoostStrategy:
                         position_size
                     )
                 else:  # sell
-                    if result.get('position_closed', False):
-                        self.close_position(symbol, current_price)
+                    # After successful sell, verify position closure and clear active_positions
+                    # Check current holdings from exchange
+                    updated_position = self.exchange.get_position(symbol)
+                    if updated_position is None or updated_position.get('quantity', 0) == 0:
+                        # Position is closed or zero, remove from active_positions
+                        self.active_positions.pop(symbol, None)
+                        self.logger.info(f"Position {symbol} closed after successful sell")
+                    else:
+                        # Partial fill - position still exists, sync positions
+                        self.sync_positions_with_exchange()
             
             return result
         
@@ -491,21 +516,21 @@ class XGBoostStrategy:
                 'error': str(e)
             }
     
-    def sync_positions_with_engine(self):
+    def sync_positions_with_exchange(self):
         """
-        Synchronize in-memory positions with paper trading engine state.
+        Synchronize in-memory positions with exchange state.
         
         Useful for initialization and recovery scenarios.
         """
-        if self.paper_trading_engine is None:
+        if self.exchange is None:
             return
         
         try:
-            engine_positions = self.paper_trading_engine.get_all_positions()
+            exchange_positions = self.exchange.get_all_positions()
             
-            # Update active_positions to match engine
+            # Update active_positions to match exchange
             self.active_positions = {}
-            for symbol, pos in engine_positions.items():
+            for symbol, pos in exchange_positions.items():
                 self.active_positions[symbol] = {
                     'entry_price': pos['entry_price'],
                     'size': pos['quantity'] * pos.get('current_price', pos['entry_price']),
@@ -513,7 +538,7 @@ class XGBoostStrategy:
                     'take_profit': pos.get('take_profit')
                 }
             
-            self.logger.info(f"Synced {len(self.active_positions)} positions with paper trading engine")
+            self.logger.info(f"Synced {len(self.active_positions)} positions with exchange")
         
         except Exception as e:
             self.logger.error(f"Failed to sync positions: {str(e)}")
